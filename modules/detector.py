@@ -1,3 +1,4 @@
+"""
 modules/detector.py
 YOLO-World open-vocabulary detector with NMS post-processing.
 
