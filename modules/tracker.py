@@ -1,17 +1,26 @@
 """
 modules/tracker.py
+
 ByteTrack multi-object tracker integrated with SPARTA.
 
-Dependencies:
-    pip install bytetracker          # or use ultralytics built-in BYTETracker
-    pip install sparta-track         # SPARTA re-ID / sparse attention tracker
+ByteTrack implementation:
+    Ultralytics built-in BYTETracker
+
+Installation:
+    python -m pip install -U ultralytics
+
+No need for:
+    bytetracker
+    lap==0.4.0
 """
 
 from __future__ import annotations
-import numpy as np
+
 import logging
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import List
+
+import numpy as np
 
 from .detector import Detection
 
@@ -20,38 +29,53 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Track:
-    """Active track produced by the tracker."""
+    """Active track produced by ByteTrack."""
+
     track_id: int
     tlbr: np.ndarray          # [x1, y1, x2, y2]
     score: float
     class_name: str = "person"
     age: int = 0              # frames since first seen
-    hits: int = 0             # total matched frames
-    state: str = "active"     # active | lost | removed
+    hits: int = 0              # total matched frames
+    state: str = "active"      # active | lost | removed
 
     @property
-    def tlwh(self):
+    def tlwh(self) -> np.ndarray:
         x1, y1, x2, y2 = self.tlbr
-        return np.array([x1, y1, x2 - x1, y2 - y1])
+        return np.array(
+            [x1, y1, x2 - x1, y2 - y1],
+            dtype=np.float32,
+        )
 
     @property
-    def center(self):
+    def center(self) -> tuple[float, float]:
         x1, y1, x2, y2 = self.tlbr
-        return ((x1 + x2) / 2, (y1 + y2) / 2)
+        return (
+            (x1 + x2) / 2.0,
+            (y1 + y2) / 2.0,
+        )
 
     @property
-    def area(self):
+    def area(self) -> float:
         x1, y1, x2, y2 = self.tlbr
-        return (x2 - x1) * (y2 - y1)
+        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
 
 # ──────────────────────────────────────────────────────────────────────
+
+
 class ByteTrackWrapper:
     """
-    Thin wrapper that exposes a unified update() API for ByteTrack.
+    Unified ByteTrack wrapper.
 
-    Falls back to a simple IoU-based tracker if ByteTrack is not installed
-    (useful for quick dev / testing without GPU).
+    Uses Ultralytics' built-in BYTETracker.
+
+    The rest of the project only sees:
+
+        detections -> update() -> List[Track]
+
+    Therefore the detector / SPARTA / behavior-analysis modules
+    do not need to know which ByteTrack implementation is used.
     """
 
     def __init__(
@@ -64,163 +88,354 @@ class ByteTrackWrapper:
         use_sparta: bool = True,
     ):
         self.min_box_area = min_box_area
+        self.frame_rate = frame_rate
         self.use_sparta = use_sparta
-        self._tracks: List[Track] = []
-        self._next_id = 1
 
+        self._tracks: List[Track] = []
+
+        # Initialize Ultralytics ByteTrack.
         self._bt = self._init_bytetrack(
-            track_thresh, track_buffer, match_thresh, frame_rate
+            track_thresh=track_thresh,
+            track_buffer=track_buffer,
+            match_thresh=match_thresh,
         )
-        self._sparta = self._init_sparta() if use_sparta else None
+
+        # Optional SPARTA Re-ID.
+        self._sparta = (
+            self._init_sparta()
+            if use_sparta
+            else None
+        )
 
     # ------------------------------------------------------------------
-    def _init_bytetrack(self, track_thresh, track_buffer, match_thresh, fps):
+    def _init_bytetrack(
+        self,
+        track_thresh: float,
+        track_buffer: int,
+        match_thresh: float,
+    ):
+        """
+        Initialize Ultralytics BYTETracker.
+
+        This avoids the old `bytetracker` package and therefore
+        avoids the problematic `lap==0.4.0` dependency.
+        """
+
         try:
-            from bytetracker import BYTETracker
+            import torch
 
-            class _Args:
-                pass
+            from ultralytics.engine.results import Boxes
+            from ultralytics.trackers.byte_tracker import BYTETracker
+            from ultralytics.utils import (
+                IterableSimpleNamespace,
+                YAML,
+            )
+            from ultralytics.utils import ROOT
 
-            args = _Args()
-            args.track_thresh = track_thresh
-            args.track_buffer = track_buffer
-            args.match_thresh = match_thresh
-            args.mot20 = False
+            # Load Ultralytics' official ByteTrack configuration.
+            yaml_path = ROOT / "cfg" / "trackers" / "bytetrack.yaml"
+            config = YAML.load(yaml_path)
 
-            tracker = BYTETracker(args, frame_rate=fps)
-            logger.info("ByteTrack initialised.")
+            # Override the parameters requested by our project.
+            config["track_high_thresh"] = track_thresh
+            config["track_buffer"] = track_buffer
+            config["match_thresh"] = match_thresh
+
+            # Build the namespace expected by BYTETracker.
+            args = IterableSimpleNamespace(**config)
+
+            tracker = BYTETracker(args)
+
+            # Store classes used by update().
+            self._torch = torch
+            self._Boxes = Boxes
+
+            logger.info(
+                "Ultralytics ByteTrack initialised successfully."
+            )
+
             return tracker
-        except ImportError:
-            logger.warning("bytetracker not installed – using fallback IoU tracker.")
+
+        except ImportError as e:
+            logger.error(
+                "Ultralytics is not installed correctly: %s",
+                e,
+            )
+            logger.error(
+                "Install it with: "
+                "python -m pip install -U ultralytics"
+            )
+            return None
+
+        except Exception as e:
+            logger.exception(
+                "Failed to initialise Ultralytics ByteTrack: %s",
+                e,
+            )
             return None
 
     # ------------------------------------------------------------------
     def _init_sparta(self):
         """
-        SPARTA (Sparse Probabilistic Re-ID Attention) optional integration.
-        Provides appearance-based re-identification to recover tracks after
-        occlusion — critical in crowded retail environments.
+        Optional SPARTA Re-ID integration.
+
+        SPARTA is not required for ByteTrack itself.
+        If the package is unavailable, tracking still works.
         """
+
         try:
             from sparta import SPARTAReID
-            reid = SPARTAReID(feature_dim=256, device="cpu")
+
+            reid = SPARTAReID(
+                feature_dim=256,
+                device="cpu",
+            )
+
             logger.info("SPARTA ReID initialised.")
             return reid
+
         except ImportError:
-            logger.warning("sparta-track not installed – ReID disabled.")
+            logger.warning(
+                "SPARTA ReID not installed - "
+                "appearance Re-ID disabled."
+            )
+            return None
+
+        except Exception as e:
+            logger.warning(
+                "SPARTA initialisation failed: %s",
+                e,
+            )
             return None
 
     # ------------------------------------------------------------------
-    def update(self, detections: List[Detection], frame: np.ndarray) -> List[Track]:
+    def update(
+        self,
+        detections: List[Detection],
+        frame: np.ndarray,
+    ) -> List[Track]:
         """
-        Feed new detections and return active tracks.
-        """
-        if not detections:
-            return self._tracks
+        Feed detections from the current frame into ByteTrack.
 
-        # Build numpy array [x1,y1,x2,y2,score] expected by ByteTrack
-        det_array = np.array([
-            [d.x1, d.y1, d.x2, d.y2, d.confidence]
+        Parameters
+        ----------
+        detections:
+            Detection objects produced by the detector.
+
+        frame:
+            Current BGR image from OpenCV.
+
+        Returns
+        -------
+        List[Track]
+            Currently active ByteTrack tracks.
+        """
+
+        if self._bt is None:
+            logger.error(
+                "ByteTrack is unavailable. "
+                "Returning empty track list."
+            )
+            return []
+
+        # --------------------------------------------------------------
+        # Filter detections by minimum bounding-box area.
+        # --------------------------------------------------------------
+
+        valid_detections = [
+            d
             for d in detections
             if d.area >= self.min_box_area
-        ], dtype=np.float32)
+        ]
 
-        if det_array.ndim == 1:
-            det_array = det_array.reshape(-1, 5)
+        # --------------------------------------------------------------
+        # Build Ultralytics Boxes tensor.
+        #
+        # Format:
+        # [x1, y1, x2, y2, confidence, class_id]
+        # --------------------------------------------------------------
 
-        if self._bt is not None:
-            raw_tracks = self._bt.update(det_array, [frame.shape[0], frame.shape[1]], [frame.shape[0], frame.shape[1]])
-            self._tracks = [
-                Track(
-                    track_id=int(t.track_id),
-                    tlbr=t.tlbr,
-                    score=float(t.score),
-                    age=t.frame_id,
-                    hits=t.tracklet_len,
-                )
-                for t in raw_tracks
-            ]
+        if valid_detections:
+
+            data = np.array(
+                [
+                    [
+                        d.x1,
+                        d.y1,
+                        d.x2,
+                        d.y2,
+                        d.confidence,
+                        0,  # person class
+                    ]
+                    for d in valid_detections
+                ],
+                dtype=np.float32,
+            )
+
         else:
-            # Fallback: very simple IoU tracker
-            self._tracks = self._iou_tracker(det_array, detections)
+            # Empty detection tensor.
+            data = np.empty(
+                (0, 6),
+                dtype=np.float32,
+            )
 
-        # SPARTA re-ID pass (refine IDs after occlusion)
-        if self._sparta and len(self._tracks) > 0:
-            self._tracks = self._apply_sparta(frame, self._tracks)
+        boxes_tensor = self._torch.from_numpy(data)
+
+        # Ultralytics Boxes requires the original image dimensions.
+        boxes = self._Boxes(
+            boxes_tensor,
+            orig_shape=(
+                frame.shape[0],
+                frame.shape[1],
+            ),
+        )
+
+        # --------------------------------------------------------------
+        # Run ByteTrack.
+        #
+        # Current Ultralytics API:
+        #
+        #     tracker.update(Boxes)
+        #
+        # Returns:
+        #
+        # [x1, y1, x2, y2, track_id, score, class_id, index]
+        # --------------------------------------------------------------
+
+        try:
+            raw_tracks = self._bt.update(boxes)
+
+        except Exception as e:
+            logger.exception(
+                "ByteTrack update failed: %s",
+                e,
+            )
+            return self._tracks
+
+        # --------------------------------------------------------------
+        # Convert Ultralytics tracks into our project's Track objects.
+        # --------------------------------------------------------------
+
+        tracks: List[Track] = []
+
+        for row in raw_tracks:
+
+            # Expected output:
+            #
+            # x1, y1, x2, y2, track_id, score, class_id, detection_idx
+
+            x1 = float(row[0])
+            y1 = float(row[1])
+            x2 = float(row[2])
+            y2 = float(row[3])
+
+            track_id = int(row[4])
+            score = float(row[5])
+
+            class_id = int(row[6]) if len(row) > 6 else 0
+
+            # Convert class ID to the project-level class name.
+            class_name = self._class_name(
+                class_id
+            )
+
+            tracks.append(
+                Track(
+                    track_id=track_id,
+                    tlbr=np.array(
+                        [x1, y1, x2, y2],
+                        dtype=np.float32,
+                    ),
+                    score=score,
+                    class_name=class_name,
+                    age=0,
+                    hits=1,
+                    state="active",
+                )
+            )
+
+        self._tracks = tracks
+
+        # --------------------------------------------------------------
+        # Optional SPARTA Re-ID.
+        # --------------------------------------------------------------
+
+        if self._sparta and self._tracks:
+            self._tracks = self._apply_sparta(
+                frame,
+                self._tracks,
+            )
 
         return self._tracks
 
     # ------------------------------------------------------------------
-    def _apply_sparta(self, frame: np.ndarray, tracks: List[Track]) -> List[Track]:
+    @staticmethod
+    def _class_name(class_id: int) -> str:
+        """
+        Convert detector class ID to project class name.
+
+        RetailGuard currently focuses on people, so class 0 is treated
+        as person. Additional classes can be added later.
+        """
+
+        if class_id == 0:
+            return "person"
+
+        return str(class_id)
+
+    # ------------------------------------------------------------------
+    def _apply_sparta(
+        self,
+        frame: np.ndarray,
+        tracks: List[Track],
+    ) -> List[Track]:
+        """
+        Apply optional SPARTA appearance-based Re-ID.
+        """
+
         try:
             crops = []
-            for t in tracks:
-                x1, y1, x2, y2 = [int(v) for v in t.tlbr]
-                crop = frame[max(0, y1):y2, max(0, x1):x2]
+
+            for track in tracks:
+
+                x1, y1, x2, y2 = [
+                    int(v)
+                    for v in track.tlbr
+                ]
+
+                # Clamp coordinates to image bounds.
+                x1 = max(0, min(x1, frame.shape[1]))
+                x2 = max(0, min(x2, frame.shape[1]))
+                y1 = max(0, min(y1, frame.shape[0]))
+                y2 = max(0, min(y2, frame.shape[0]))
+
+                crop = frame[y1:y2, x1:x2]
+
                 if crop.size > 0:
                     crops.append(crop)
                 else:
-                    crops.append(np.zeros((64, 32, 3), dtype=np.uint8))
+                    crops.append(
+                        np.zeros(
+                            (64, 32, 3),
+                            dtype=np.uint8,
+                        )
+                    )
 
-            refined_ids = self._sparta.match(crops, [t.track_id for t in tracks])
-            for t, rid in zip(tracks, refined_ids):
-                t.track_id = rid
+            refined_ids = self._sparta.match(
+                crops,
+                [t.track_id for t in tracks],
+            )
+
+            for track, refined_id in zip(
+                tracks,
+                refined_ids,
+            ):
+                track.track_id = int(refined_id)
+
         except Exception as e:
-            logger.debug(f"SPARTA pass failed: {e}")
+            logger.debug(
+                "SPARTA pass failed: %s",
+                e,
+            )
+
         return tracks
-
-    # ------------------------------------------------------------------
-    def _iou_tracker(self, det_array: np.ndarray, detections: List[Detection]) -> List[Track]:
-        """Minimal IoU-based fallback tracker."""
-        import scipy.optimize
-
-        if not self._tracks:
-            tracks = []
-            for i, d in enumerate(detections):
-                tracks.append(Track(
-                    track_id=self._next_id,
-                    tlbr=np.array([d.x1, d.y1, d.x2, d.y2]),
-                    score=d.confidence,
-                    class_name=d.class_name,
-                ))
-                self._next_id += 1
-            return tracks
-
-        def iou(b1, b2):
-            ix1 = max(b1[0], b2[0]); iy1 = max(b1[1], b2[1])
-            ix2 = min(b1[2], b2[2]); iy2 = min(b1[3], b2[3])
-            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-            a1 = (b1[2]-b1[0])*(b1[3]-b1[1])
-            a2 = (b2[2]-b2[0])*(b2[3]-b2[1])
-            return inter / (a1 + a2 - inter + 1e-6)
-
-        cost = np.zeros((len(self._tracks), len(detections)))
-        for i, t in enumerate(self._tracks):
-            for j, d in enumerate(detections):
-                cost[i, j] = 1 - iou(t.tlbr, [d.x1, d.y1, d.x2, d.y2])
-
-        row_ind, col_ind = scipy.optimize.linear_sum_assignment(cost)
-        matched_t, matched_d = set(), set()
-        new_tracks = []
-
-        for r, c in zip(row_ind, col_ind):
-            if cost[r, c] < 0.7:
-                t = self._tracks[r]
-                d = detections[c]
-                t.tlbr = np.array([d.x1, d.y1, d.x2, d.y2])
-                t.score = d.confidence
-                t.hits += 1
-                new_tracks.append(t)
-                matched_t.add(r); matched_d.add(c)
-
-        for j, d in enumerate(detections):
-            if j not in matched_d:
-                new_tracks.append(Track(
-                    track_id=self._next_id,
-                    tlbr=np.array([d.x1, d.y1, d.x2, d.y2]),
-                    score=d.confidence,
-                    class_name=d.class_name,
-                ))
-                self._next_id += 1
-
-        return new_tracks
