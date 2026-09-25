@@ -1,5 +1,3 @@
-```python
-"""
 modules/detector.py
 YOLO-World open-vocabulary detector with NMS post-processing.
 
@@ -339,4 +337,3 @@ class YOLOWorldDetector:
                     detections.append(det)
 
         return detections
-```
