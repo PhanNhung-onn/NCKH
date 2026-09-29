@@ -131,18 +131,18 @@ def _build_autoencoder(input_dim: int = 24):
     class Autoencoder(nn.Module):
         def __init__(self, d: int):
             super().__init__()
-            self.enc = nn.Sequential(
+            self.encoder = nn.Sequential(
                 nn.Linear(d, 16), nn.ReLU(),
                 nn.Linear(16, 8),  nn.ReLU(),
                 nn.Linear(8, 4),
             )
-            self.dec = nn.Sequential(
+            self.decoder = nn.Sequential(
                 nn.Linear(4, 8),  nn.ReLU(),
                 nn.Linear(8, 16), nn.ReLU(),
                 nn.Linear(16, d),
             )
 
         def forward(self, x):
-            return self.dec(self.enc(x))
+            return self.decoder(self.encoder(x))
 
     return Autoencoder(input_dim)
