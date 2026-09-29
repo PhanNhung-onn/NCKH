@@ -130,6 +130,24 @@ class BehaviorFeatureExtractor:
         centers = np.array(list(hist.centers))   # (N, 2)
         sizes   = np.array(list(hist.sizes))     # (N, 2)
 
+        # ── Shelf interaction signal ─────────────────────────────
+        # Phát hiện "tay chạm kệ" qua thay đổi đột ngột của bbox_h
+        bbox_h_series = sizes[:, 1]                          # chiều cao bbox qua thời gian
+        h_diff = np.diff(bbox_h_series)
+
+        # Reach event: bbox_h giảm (người cúi/vươn tay) rồi tăng lại
+        reach_events = float(np.sum(
+            (h_diff[:-1] < -0.01) & (h_diff[1:] > 0.01)
+        ))
+
+        # Sau reach: bbox tiếp tục nhỏ hơn trước = đang cầm đồ (lấy hàng)
+        # Sau reach: bbox trở về bình thường = đặt lại (trả hàng)
+        pre_reach_h  = float(np.mean(bbox_h_series[:5]))     # chiều cao ban đầu
+        post_reach_h = float(np.mean(bbox_h_series[-5:]))    # chiều cao cuối
+        shelf_return_signal = float(post_reach_h / (pre_reach_h + 1e-6))
+        # > 1.0 → bbox lớn hơn sau tương tác = đặt đồ lại (giảm nghi ngờ)
+        # < 1.0 → bbox nhỏ hơn = đang cầm đồ (tăng nghi ngờ)
+
         # ── Kinematic features ──────────────────────────────────────
         disps = np.linalg.norm(np.diff(centers, axis=0), axis=1)   # (N-1,)
         speed_mean = float(np.mean(disps)) if len(disps) else 0.0
