@@ -1,4 +1,8 @@
 """
+test.py — Kiểm thử toàn bộ pipeline nhận diện hành vi bất thường
+=================================================================
+Chạy độc lập, KHÔNG cần alert.py / database.py / visualizer.py.
+
 Cách dùng:
     python test.py --video input.mp4
     python test.py --video input.mp4 --model models/anomaly_model.pkl
@@ -140,8 +144,8 @@ class _MockVisualizer:
         for track in tracks:
             tid = track.track_id
             info = anomaly_map.get(tid, {"score": 0.0, "is_anomaly": False})
-            score = float(info.get("score", 0.0))
-            is_anom = bool(info.get("is_anomaly", False))
+            score = info["score"]
+            is_anom = info["is_anomaly"]
 
             x1, y1, x2, y2 = [int(v) for v in track.tlbr]
             color = self.ANOMALY_COLOR if is_anom else self.NORMAL_COLOR
@@ -179,7 +183,7 @@ class _MockVisualizer:
             f"Frame: {frame_idx}",
             f"FPS:   {fps:.1f}",
             f"Tracks: {len(tracks)}",
-            f"Anomalies: {sum(1 for v in anomaly_map.values() if v.get('is_anomaly', False))}",
+            f"Anomalies: {sum(1 for v in anomaly_map.values() if v['is_anomaly'])}",
         ]
         for i, line in enumerate(hud_lines):
             y = 22 + i * 20
@@ -334,15 +338,8 @@ class VideoTester:
 
                 # ── Hiển thị ──────────────────────────────────────────
                 if self.cfg.display:
-                    try:
-                        cv2.imshow("Retail Anomaly — Test", result_frame)
-                        key = cv2.waitKey(1) & 0xFF
-                    except cv2.error as e:
-                        logger.warning(
-                            f"OpenCV GUI không khả dụng; tự chuyển sang headless: {e}"
-                        )
-                        self.cfg.display = False
-                        key = -1
+                    cv2.imshow("Retail Anomaly — Test", result_frame)
+                    key = cv2.waitKey(1) & 0xFF
                     if key == ord("q"):
                         logger.info("Người dùng nhấn Q — dừng sớm.")
                         break
@@ -368,13 +365,7 @@ class VideoTester:
             cap.release()
             if writer:
                 writer.release()
-            if self.cfg.display:
-                try:
-                    cv2.destroyAllWindows()
-                except cv2.error:
-                    # Headless environments (e.g. Kaggle) may not provide
-                    # an OpenCV HighGUI backend.
-                    pass
+            cv2.destroyAllWindows()
 
         elapsed_total = time.time() - t_start
         report = self._build_report(elapsed_total, src_fps, total_frames)
@@ -427,7 +418,6 @@ class VideoTester:
                 anomaly_events.append({
                     "track_id": tid,
                     "score":    round(score, 4),
-                    "is_anomaly": True,
                     "bbox":     [round(v, 1) for v in bbox],
                 })
                 # Mock alert + DB
