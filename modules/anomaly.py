@@ -100,14 +100,29 @@ class AnomalyScorer:
         """
         API gốc — không cần track_id.
         Shelf signal được tính từ feature_vec[11] (bbox_h, index 11).
+
+        Input có thể là vector 1-D hoặc batch 2-D dạng (1, D).
+        Chuẩn hóa về 1-D để hai dạng input cho cùng một kết quả.
         """
-        # Lấy bbox_h từ feature vector (index 11 = bbox_h, xem features.py)
-        bbox_h = float(feature_vec[11]) if len(feature_vec) > 11 else 0.0
+        feature_vec = np.asarray(feature_vec, dtype=np.float32).reshape(-1)
 
-        raw_score = self._compute_base_score(feature_vec[:FEATURE_DIM])
+        # Chỉ dùng FEATURE_DIM feature đầu tiên; nếu thiếu thì pad 0.
+        if feature_vec.size < FEATURE_DIM:
+            x_features = np.pad(
+                feature_vec,
+                (0, FEATURE_DIM - feature_vec.size),
+                mode="constant",
+            )
+        else:
+            x_features = feature_vec[:FEATURE_DIM]
 
-        shelf_signal, reach_events = _compute_shelf_signal_from_feature(feature_vec)
-        adjusted    = self._apply_shelf_adjustment(raw_score, shelf_signal, reach_events)
+        raw_score = self._compute_base_score(x_features)
+
+        # Luôn truyền vector 1-D đã chuẩn hóa.
+        shelf_signal, reach_events = _compute_shelf_signal_from_feature(x_features)
+        adjusted = self._apply_shelf_adjustment(
+            raw_score, shelf_signal, reach_events
+        )
 
         return adjusted, adjusted >= self.threshold
 
