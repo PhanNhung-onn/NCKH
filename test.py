@@ -85,6 +85,12 @@ class TestConfig:
     pose_conf: float         = 0.5
     enable_pose: bool        = True
 
+    # Combined anomaly scoring (kine​matic + pose/Shopformer)
+    pose_tokenizer_path: str = "models/pose_tokenizer.pt"
+    pose_threshold: float    = 0.60
+    kinematic_weight: float  = 0.45
+    pose_weight: float       = 0.55
+
 
 # ══════════════════════════════════════════════════════════════════════
 # 2. MOCK CHO CÁC MODULE CHƯA VIẾT
@@ -245,7 +251,7 @@ class VideoTester:
         from modules.detector import YOLOWorldDetector
         from modules.tracker  import ByteTrackWrapper
         from modules.features import BehaviorFeatureExtractor
-        from modules.anomaly  import AnomalyScorer
+        from modules.anomaly  import CombinedScorer
 
         self.pose_extractor = None
         if self.cfg.enable_pose:
@@ -277,10 +283,17 @@ class VideoTester:
             match_thresh=0.8,
         )
         self.feat_ext = BehaviorFeatureExtractor(window=self.cfg.window_size)
-        self.scorer   = AnomalyScorer(
-            model_path=self.cfg.model_path,
-            threshold=self.cfg.anomaly_threshold,
+        # Phải dùng đúng CombinedScorer như inference_pipeline.py:
+        # kinematic feature_vec + pose keypoints -> final anomaly score.
+        self.scorer = CombinedScorer(
+            kinematic_model_path=self.cfg.model_path,
+            pose_tokenizer_path=self.cfg.pose_tokenizer_path,
+            kinematic_threshold=self.cfg.anomaly_threshold,
+            pose_threshold=self.cfg.pose_threshold,
+            kinematic_weight=self.cfg.kinematic_weight,
+            pose_weight=self.cfg.pose_weight,
         )
+        self._active_tracks: set[int] = set()
         logger.info(f"{_G}[INIT]{_X} Pipeline sẵn sàng.")
 
     # ------------------------------------------------------------------
@@ -462,28 +475,71 @@ class VideoTester:
         if self.pose_extractor is not None:
             self._draw_pose(frame, tracks, pose_map)
 
-        # 5. Anomaly scoring
+        # 5. Dọn history của track đã mất — giống inference_pipeline.py
+        current_ids = {t.track_id for t in tracks}
+        lost_ids = self._active_tracks - current_ids
+        for tid in lost_ids:
+            if hasattr(self.scorer, "clear_track"):
+                self.scorer.clear_track(tid)
+            if hasattr(self.feat_ext, "_histories"):
+                self.feat_ext._histories.pop(tid, None)
+        self._active_tracks = current_ids
+
+        # 6. Combined anomaly scoring
+        # Giống inference_pipeline.py: score(track_id, feature_vec, kpts, bbox_h)
+        # KHÔNG nối kinematic + pose thành một vector. CombinedScorer tự kết hợp
+        # hai score theo kinematic_weight / pose_weight.
         anomaly_map: Dict[int, dict] = {}
         anomaly_events: List[dict]   = []
 
         for tid, vec in feat_map.items():
-            score, is_anom = self.scorer.score(vec)
-            anomaly_map[tid] = {"score": score, "is_anomaly": is_anom}
+            track = next((t for t in tracks if t.track_id == tid), None)
+            bbox_h = (
+                float(track.tlbr[3] - track.tlbr[1]) / frame.shape[0]
+                if track is not None else None
+            )
+            kpts = pose_map.get(tid)
+
+            score, is_anom, detail = self.scorer.score(
+                track_id=tid,
+                feature_vec=vec,
+                kpts=kpts,
+                bbox_h=bbox_h,
+            )
+
+            k_score = detail.get("kinematic_score")
+            p_score = detail.get("pose_score")
+            action = detail.get("action", "")
+
+            anomaly_map[tid] = {
+                "score": score,
+                "is_anomaly": is_anom,
+                "kinematic_score": k_score,
+                "pose_score": p_score,
+                "action": action,
+            }
 
             if self.cfg.verbose_score:
                 flag = f"{_R}ANOMALY{_X}" if is_anom else f"{_G}normal {_X}"
-                logger.debug(f"  Track #{tid:3d}  score={score:.4f}  [{flag}]")
+                logger.debug(
+                    f"  Track #{tid:3d}  final={score:.4f}  "
+                    f"kinematic={float(k_score):.4f}  "
+                    f"pose={float(p_score):.4f}  action={action or '-'}  [{flag}]"
+                    if k_score is not None and p_score is not None
+                    else f"  Track #{tid:3d}  final={score:.4f}  [{flag}]"
+                )
 
             if is_anom:
-                track = next((t for t in tracks if t.track_id == tid), None)
-                bbox  = track.tlbr.tolist() if track else []
+                bbox = track.tlbr.tolist() if track is not None else []
                 anomaly_events.append({
                     "track_id": tid,
-                    "score":    round(score, 4),
+                    "score": round(float(score), 4),
                     "is_anomaly": True,
-                    "bbox":     [round(v, 1) for v in bbox],
+                    "bbox": [round(v, 1) for v in bbox],
+                    "kinematic_score": (round(float(k_score), 4) if k_score is not None else None),
+                    "pose_score": (round(float(p_score), 4) if p_score is not None else None),
+                    "action": action,
                 })
-                # Mock alert + DB
                 self._alert.trigger(tid, score, frame, ts)
                 self._db.log_event(tid, score, ts, bbox)
 
@@ -632,6 +688,11 @@ class VideoTester:
                 "pose_enabled": self.cfg.enable_pose,
                 "pose_model":   self.cfg.pose_model,
                 "pose_conf":    self.cfg.pose_conf,
+                "pose_tokenizer": self.cfg.pose_tokenizer_path,
+                "pose_threshold": self.cfg.pose_threshold,
+                "kinematic_weight": self.cfg.kinematic_weight,
+                "pose_weight": self.cfg.pose_weight,
+                "scoring": "CombinedScorer(kinematic + pose)",
                 "tested_at":    time.strftime("%Y-%m-%d %H:%M:%S"),
             },
             "summary": {
@@ -1013,6 +1074,20 @@ Ví dụ:
                    help="Giới hạn frame (0=toàn bộ)")
     p.add_argument("--conf",           type=float, default=0.35,
                    help="Ngưỡng confidence YOLO")
+    p.add_argument("--pose-model",    default="yolov8n-pose.pt",
+                   help="YOLOv8-pose model dùng để lấy 17 keypoints")
+    p.add_argument("--pose-conf",     type=float, default=0.5,
+                   help="Confidence cho PoseExtractor")
+    p.add_argument("--pose-tokenizer", default="models/pose_tokenizer.pt",
+                   help="Shopformer/GCAE pose tokenizer")
+    p.add_argument("--pose-threshold", type=float, default=0.60,
+                   help="Ngưỡng pose anomaly")
+    p.add_argument("--kinematic-weight", type=float, default=0.45,
+                   help="Trọng số kinematic trong CombinedScorer")
+    p.add_argument("--pose-weight", type=float, default=0.55,
+                   help="Trọng số pose trong CombinedScorer")
+    p.add_argument("--no-pose", action="store_true",
+                   help="Tắt pose; CombinedScorer sẽ chạy theo khả năng fallback của module")
     p.add_argument("--save-video",     default="",
                    help="Đường dẫn lưu video output (mặc định: output/<tên>_result.mp4)")
     p.add_argument("--report",         default="",
@@ -1053,6 +1128,10 @@ if __name__ == "__main__":
         pose_model        = args.pose_model,
         pose_conf         = args.pose_conf,
         enable_pose       = not args.no_pose,
+        pose_tokenizer_path = args.pose_tokenizer,
+        pose_threshold    = args.pose_threshold,
+        kinematic_weight  = args.kinematic_weight,
+        pose_weight       = args.pose_weight,
         save_video        = args.save_video,
         report_path       = args.report,
         output_dir        = args.output_dir,
