@@ -80,6 +80,11 @@ class TestConfig:
     show_features: bool     = False     # in bảng feature vector ra log
     verbose_score: bool     = True      # in điểm từng track ra log
 
+    # Pose extraction (theo inference_pipeline.py)
+    pose_model: str          = "yolov8n-pose.pt"
+    pose_conf: float         = 0.5
+    enable_pose: bool        = True
+
 
 # ══════════════════════════════════════════════════════════════════════
 # 2. MOCK CHO CÁC MODULE CHƯA VIẾT
@@ -206,6 +211,8 @@ class FrameResult:
     n_detections: int
     n_tracks:     int
     anomalies:    List[dict]   # [{track_id, score}]
+    pose_tracks:  int          # số track có pose hợp lệ
+    pose_keypoints: int        # tổng số keypoint có confidence > 0
     proc_ms:      float        # thời gian xử lý (ms)
 
 
@@ -239,6 +246,25 @@ class VideoTester:
         from modules.tracker  import ByteTrackWrapper
         from modules.features import BehaviorFeatureExtractor
         from modules.anomaly  import AnomalyScorer
+
+        self.pose_extractor = None
+        if self.cfg.enable_pose:
+            try:
+                from modules.pose_extractor import PoseExtractor
+                self.pose_extractor = PoseExtractor(
+                    model_name=self.cfg.pose_model,
+                    conf=self.cfg.pose_conf,
+                )
+                logger.info(
+                    f"{_G}[POSE]{_X} PoseExtractor ON "
+                    f"(model={self.cfg.pose_model}, conf={self.cfg.pose_conf})"
+                )
+            except ImportError as e:
+                logger.warning(f"{_Y}[POSE]{_X} Không import được PoseExtractor: {e}")
+            except Exception as e:
+                logger.warning(f"{_Y}[POSE]{_X} Không khởi tạo được pose model: {e}")
+        else:
+            logger.info(f"{_Y}[POSE]{_X} PoseExtractor OFF")
 
         self.detector = YOLOWorldDetector(
             classes=self.cfg.classes,
@@ -402,12 +428,39 @@ class VideoTester:
         # 3. Track
         tracks = self.tracker.update(detections, frame)
 
+        # 3b. Pose extraction — giống inference_pipeline.py:
+        #     PoseExtractor.extract(frame, track.tlbr) -> (17, 3) hoặc None
+        pose_map: Dict[int, Optional[np.ndarray]] = {}
+        pose_tracks = 0
+        pose_keypoints = 0
+
+        if self.pose_extractor is not None:
+            for track in tracks:
+                try:
+                    kpts = self.pose_extractor.extract(frame, track.tlbr)
+                    pose_map[track.track_id] = kpts
+
+                    if kpts is not None:
+                        arr = np.asarray(kpts)
+                        if arr.ndim == 2 and arr.shape[0] == 17 and arr.shape[1] >= 3:
+                            pose_tracks += 1
+                            pose_keypoints += int(np.sum(arr[:, 2] > 0))
+                except Exception as e:
+                    logger.warning(
+                        f"{_Y}[POSE]{_X} Track #{track.track_id} extract lỗi: {e}"
+                    )
+                    pose_map[track.track_id] = None
+
         # 4. Feature extraction
         feat_map = self.feat_ext.update(tracks, frame)
 
         if self.cfg.show_features and feat_map:
             df = self.feat_ext.to_dataframe(feat_map)
             logger.debug(f"Features frame {frame_idx}:\n{df.to_string()}")
+
+        # 4b. Vẽ pose để kiểm tra trực quan
+        if self.pose_extractor is not None:
+            self._draw_pose(frame, tracks, pose_map)
 
         # 5. Anomaly scoring
         anomaly_map: Dict[int, dict] = {}
@@ -440,9 +493,67 @@ class VideoTester:
             n_detections = len(detections),
             n_tracks     = len(tracks),
             anomalies    = anomaly_events,
+            pose_tracks  = pose_tracks,
+            pose_keypoints = pose_keypoints,
             proc_ms      = 0.0,
         )
         return frame, fr
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _draw_pose(
+        frame: np.ndarray,
+        tracks,
+        pose_map: Dict[int, Optional[np.ndarray]],
+    ) -> None:
+        """Vẽ 17 COCO keypoints cho từng track có pose hợp lệ.
+
+        PoseExtractor hiện trả về (17, 3): [x, y, confidence].
+        Chỉ vẽ keypoint có confidence > 0.
+        """
+        # COCO-17 skeleton: nose, eyes, ears, shoulders, elbows, wrists,
+        # hips, knees, ankles.
+        skeleton = [
+            (0, 1), (0, 2), (1, 3), (2, 4),
+            (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+            (5, 11), (6, 12), (11, 12),
+            (11, 13), (13, 15), (12, 14), (14, 16),
+        ]
+
+        for track in tracks:
+            kpts = pose_map.get(track.track_id)
+            if kpts is None:
+                continue
+
+            arr = np.asarray(kpts)
+            if arr.ndim != 2 or arr.shape[0] != 17 or arr.shape[1] < 3:
+                continue
+
+            # Keypoints
+            for x, y, conf in arr[:, :3]:
+                if conf <= 0:
+                    continue
+                xi, yi = int(round(x)), int(round(y))
+                if 0 <= xi < frame.shape[1] and 0 <= yi < frame.shape[0]:
+                    cv2.circle(frame, (xi, yi), 3, (255, 200, 0), -1)
+
+            # Skeleton
+            for a, b in skeleton:
+                xa, ya, ca = arr[a, :3]
+                xb, yb, cb = arr[b, :3]
+                if ca <= 0 or cb <= 0:
+                    continue
+                p1 = (int(round(xa)), int(round(ya)))
+                p2 = (int(round(xb)), int(round(yb)))
+                cv2.line(frame, p1, p2, (255, 200, 0), 2, cv2.LINE_AA)
+
+            # Pose status cạnh bbox
+            x1, y1, _, _ = [int(v) for v in track.tlbr]
+            valid = int(np.sum(arr[:, 2] > 0))
+            cv2.putText(
+                frame, f"Pose {valid}/17", (x1, max(y1 - 22, 12)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 1, cv2.LINE_AA,
+            )
 
     # ------------------------------------------------------------------
     def _open_video(self) -> cv2.VideoCapture:
@@ -518,6 +629,9 @@ class VideoTester:
                 "threshold":    self.cfg.anomaly_threshold,
                 "window":       self.cfg.window_size,
                 "frame_skip":   self.cfg.frame_skip,
+                "pose_enabled": self.cfg.enable_pose,
+                "pose_model":   self.cfg.pose_model,
+                "pose_conf":    self.cfg.pose_conf,
                 "tested_at":    time.strftime("%Y-%m-%d %H:%M:%S"),
             },
             "summary": {
@@ -533,6 +647,11 @@ class VideoTester:
                 "anomaly_frame_rate":    round(
                     len([r for r in self.results if r.anomalies]) / max(n_proc, 1), 4
                 ),
+                "pose_frame_rate":       round(
+                    len([r for r in self.results if r.pose_tracks > 0]) / max(n_proc, 1), 4
+                ),
+                "pose_tracks_detected":  int(sum(r.pose_tracks for r in self.results)),
+                "pose_keypoints_detected": int(sum(r.pose_keypoints for r in self.results)),
             },
             "anomaly_tracks": {
                 str(tid): stats for tid, stats in track_stats.items()
@@ -578,6 +697,10 @@ class VideoTester:
         print(f"  {color}Tổng sự kiện bất thường : {n}{_X}")
         print(f"  {color}Track bất thường duy nhất: {t}{_X}")
         print(f"  Tỷ lệ frame bất thường  : {r*100:.1f}%")
+        if self.cfg.enable_pose:
+            print(f"  Pose frame rate         : {s['pose_frame_rate']*100:.1f}%")
+            print(f"  Track có pose           : {s['pose_tracks_detected']}")
+            print(f"  Keypoints hợp lệ        : {s['pose_keypoints_detected']}")
         if report["anomaly_tracks"]:
             print(f"{'─'*60}")
             print(f"  Chi tiết từng track bất thường:")
@@ -927,6 +1050,9 @@ if __name__ == "__main__":
         frame_skip        = args.frame_skip,
         max_frames        = args.max_frames,
         conf_threshold    = args.conf,
+        pose_model        = args.pose_model,
+        pose_conf         = args.pose_conf,
+        enable_pose       = not args.no_pose,
         save_video        = args.save_video,
         report_path       = args.report,
         output_dir        = args.output_dir,
