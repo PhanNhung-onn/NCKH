@@ -16,6 +16,7 @@ Kết quả xuất ra:
 
 from __future__ import annotations
 
+import math
 import argparse
 import json
 import logging
@@ -228,6 +229,18 @@ class VideoTester:
     Hoàn toàn độc lập với alert.py / database.py / visualizer.py.
     """
 
+    def point_to_bbox_distance(px, py, bbox):
+        """
+        Khoảng cách từ một điểm đến cạnh gần nhất của bbox.
+        Nếu điểm nằm bên trong bbox -> distance = 0.
+        """
+        x1, y1, x2, y2 = map(float, bbox)
+
+        dx = max(x1 - px, 0.0, px - x2)
+        dy = max(y1 - py, 0.0, py - y2)
+
+        return math.sqrt(dx * dx + dy * dy)
+    
     def __init__(self, cfg: TestConfig):
         self.cfg = cfg
         Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
@@ -482,6 +495,90 @@ class VideoTester:
         if self.cfg.show_features and feat_map:
             df = self.feat_ext.to_dataframe(feat_map)
             logger.debug(f"Features frame {frame_idx}:\n{df.to_string()}")
+
+        # ============================================================
+        # DEBUG: WRIST -> BOTTLE / BOX DISTANCE
+        # ============================================================
+
+        if frame_idx % 10 == 0:
+
+            print(f"\n[WRIST → OBJECT DEBUG] Frame {frame_idx}")
+
+            for track in tracks:
+
+                tid = track.track_id
+                kpts = pose_map.get(tid)
+
+                if kpts is None:
+                    continue
+
+                # COCO:
+                # 9  = left wrist
+                # 10 = right wrist
+                left_wrist = kpts[9]
+                right_wrist = kpts[10]
+
+                # Person height dùng để normalize khoảng cách
+                tx1, ty1, tx2, ty2 = map(float, track.tlbr)
+                person_height = max(ty2 - ty1, 1.0)
+
+                wrists = {
+                    "L": left_wrist,
+                    "R": right_wrist,
+                }
+
+                for det in detections:
+
+                    class_name = str(
+                        getattr(det, "class_name", "")
+                    ).strip().lower()
+
+                    # Chỉ debug bottle / box
+                    if class_name not in {"bottle", "box"}:
+                        continue
+
+                    confidence = getattr(det, "confidence", None)
+
+                    if confidence is None:
+                        confidence = getattr(det, "conf", 0.0)
+
+                    bbox = det.tlbr
+
+                    print(
+                        f"  Track #{tid} -> "
+                        f"{class_name} "
+                        f"conf={float(confidence):.3f} "
+                        f"bbox={bbox}"
+                    )
+
+                    for wrist_name, wrist in wrists.items():
+
+                        wx = float(wrist[0])
+                        wy = float(wrist[1])
+                        wrist_conf = float(wrist[2])
+
+                        # Bỏ qua wrist không đáng tin
+                        if wrist_conf < 0.3:
+                            continue
+
+                        distance_px = point_to_bbox_distance(
+                            wx * frame.shape[1],
+                            wy * frame.shape[0],
+                            bbox
+                        )
+
+                        normalized_distance = (
+                            distance_px / person_height
+                        )
+
+                        print(
+                            f"      wrist={wrist_name} "
+                            f"xy=({wx * frame.shape[1]:.1f},"
+                            f"{wy * frame.shape[0]:.1f}) "
+                            f"conf={wrist_conf:.3f} "
+                            f"distance={distance_px:.1f}px "
+                            f"normalized={normalized_distance:.3f}"
+                        )
 
         # 4b. Vẽ pose để kiểm tra trực quan
         if self.pose_extractor is not None:
