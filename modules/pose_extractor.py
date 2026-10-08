@@ -126,6 +126,14 @@ class PoseExtractor:
         # 6. Debug shape
         # =====================================================
 
+        print(
+            f"[POSE DEBUG] "
+            f"bbox=({x1},{y1},{x2},{y2}) "
+            f"crop={crop.shape[:2]} "
+            f"persons={len(kpts)} "
+            f"kpts_shape={tuple(kpts.shape)}"
+        )
+
         # =====================================================
         # 7. First detected person
         # =====================================================
@@ -158,5 +166,11 @@ class PoseExtractor:
 
         left_wrist = kp[9]
         right_wrist = kp[10]
+
+        print(
+            f"[POSE WRIST] "
+            f"L={left_wrist} "
+            f"R={right_wrist}"
+        )
 
         return kp
