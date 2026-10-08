@@ -243,6 +243,12 @@ class VideoTester:
         self._fps_buf: List[float] = []
         self._current_fps = 0.0
 
+        # Thống kê pose theo từng track: bao nhiêu lần extract được pose
+        # thành công / tổng số lần track được xử lý.
+        self.pose_stats: Dict[int, dict] = defaultdict(
+            lambda: {"total": 0, "success": 0, "keypoints": 0}
+        )
+
     # ------------------------------------------------------------------
     def _init_pipeline(self):
         """Import + khởi tạo các module thật."""
@@ -450,19 +456,25 @@ class VideoTester:
         if self.pose_extractor is not None:
             for track in tracks:
                 try:
+                    tid = int(track.track_id)
+                    self.pose_stats[tid]["total"] += 1
+
                     kpts = self.pose_extractor.extract(frame, track.tlbr)
-                    pose_map[track.track_id] = kpts
+                    pose_map[tid] = kpts
 
                     if kpts is not None:
                         arr = np.asarray(kpts)
                         if arr.ndim == 2 and arr.shape[0] == 17 and arr.shape[1] >= 3:
                             pose_tracks += 1
-                            pose_keypoints += int(np.sum(arr[:, 2] > 0))
+                            valid_kpts = int(np.sum(arr[:, 2] > 0))
+                            pose_keypoints += valid_kpts
+                            self.pose_stats[tid]["success"] += 1
+                            self.pose_stats[tid]["keypoints"] += valid_kpts
                 except Exception as e:
                     logger.warning(
                         f"{_Y}[POSE]{_X} Track #{track.track_id} extract lỗi: {e}"
                     )
-                    pose_map[track.track_id] = None
+                    pose_map[tid] = None
 
         # 4. Feature extraction
         feat_map = self.feat_ext.update(tracks, frame)
@@ -678,6 +690,18 @@ class VideoTester:
             track_stats[tid]["mean_score"] = round(float(np.mean(s)), 4)
             del track_stats[tid]["scores"]
 
+        # Thống kê pose theo từng track.
+        pose_by_track = {}
+        for tid, stat in sorted(self.pose_stats.items()):
+            total = int(stat["total"])
+            success = int(stat["success"])
+            pose_by_track[str(tid)] = {
+                "total_frames": total,
+                "pose_success": success,
+                "pose_success_rate": round(success / total, 4) if total else 0.0,
+                "valid_keypoints": int(stat["keypoints"]),
+            }
+
         report = {
             "meta": {
                 "video":        self.cfg.video_path,
@@ -714,6 +738,7 @@ class VideoTester:
                 "pose_tracks_detected":  int(sum(r.pose_tracks for r in self.results)),
                 "pose_keypoints_detected": int(sum(r.pose_keypoints for r in self.results)),
             },
+            "pose_by_track": pose_by_track,
             "anomaly_tracks": {
                 str(tid): stats for tid, stats in track_stats.items()
             },
@@ -762,6 +787,21 @@ class VideoTester:
             print(f"  Pose frame rate         : {s['pose_frame_rate']*100:.1f}%")
             print(f"  Track có pose           : {s['pose_tracks_detected']}")
             print(f"  Keypoints hợp lệ        : {s['pose_keypoints_detected']}")
+
+            print(f"{'─'*60}")
+            print("  POSE SUCCESS BY TRACK")
+            print(f"{'─'*60}")
+            for tid, stat in report.get("pose_by_track", {}).items():
+                total = stat["total_frames"]
+                success = stat["pose_success"]
+                rate = stat["pose_success_rate"] * 100.0
+                kpts = stat["valid_keypoints"]
+                print(
+                    f"    Track #{tid:>4s}  "
+                    f"pose={success:4d}/{total:<4d}  "
+                    f"({rate:5.1f}%)  "
+                    f"keypoints={kpts}"
+                )
         if report["anomaly_tracks"]:
             print(f"{'─'*60}")
             print(f"  Chi tiết từng track bất thường:")
